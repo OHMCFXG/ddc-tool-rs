@@ -320,6 +320,9 @@ fn listen_feature(device_input: String, feature_code: u8) -> Result<()> {
     // Print initial value
     println!("{}", initial_value);
     
+    // Track last printed value for deduplication
+    let mut last_value = initial_value;
+    
     // Prepare file monitoring
     let cache_path = get_cache_path(&device_input, feature_code);
     let cache_file = PathBuf::from(&cache_path);
@@ -350,11 +353,21 @@ fn listen_feature(device_input: String, feature_code: u8) -> Result<()> {
         
         // Read and print new value, try to get from device if cache fails
         match read_value_from_cache(&device_input, feature_code) {
-            Ok(new_value) => println!("{}", new_value),
+            Ok(new_value) => {
+                // Only print if value has changed
+                if new_value != last_value {
+                    println!("{}", new_value);
+                    last_value = new_value;
+                }
+            },
             Err(_) => {
                 if let Ok(value) = get_feature_value(&device_input, feature_code) {
                     save_value_to_cache(&device_input, feature_code, value)?;
-                    println!("{}", value);
+                    // Only print if value has changed
+                    if value != last_value {
+                        println!("{}", value);
+                        last_value = value;
+                    }
                 }
             }
         }
