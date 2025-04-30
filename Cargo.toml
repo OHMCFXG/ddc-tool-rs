@@ -1,0 +1,20 @@
+[package]
+name = "ddc-tool-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Control monitor features via DDC/CI"
+authors = ["OHMCFXG"]
+license = "GPL-3.0"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = "thin"
+codegen-units = 1
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "cargo", "env"] }
+ddc = "0.2"
+ddc-i2c = { version = "0.2", features = ["with-linux"] }
+anyhow = "1.0"
+notify = "8.0.0"
