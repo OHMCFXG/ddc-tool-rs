@@ -1,5 +1,4 @@
-use std::fs;
-use std::fs::read_dir;
+use std::fs::{self, read_dir};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -9,6 +8,32 @@ use ddc::Ddc;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 const DEFAULT_CACHE_DIR: &str = "/tmp/ddc-tool-rs";
+
+/// DDC device wrapper for common operations
+struct DdcDevice {
+    device_path: String,
+}
+
+impl DdcDevice {
+    fn new(device_input: &str) -> Result<Self> {
+        let device_path = get_i2c_dev(device_input)?;
+        Ok(Self { device_path })
+    }
+
+    fn get_vcp_feature(&self, feature_code: u8) -> Result<ddc::VcpValue> {
+        let mut ddc = ddc_i2c::from_i2c_device(&self.device_path)
+            .context("Failed to open I2C device")?;
+        ddc.get_vcp_feature(feature_code)
+            .context("Failed to get VCP feature")
+    }
+
+    fn set_vcp_feature(&self, feature_code: u8, value: u16) -> Result<()> {
+        let mut ddc = ddc_i2c::from_i2c_device(&self.device_path)
+            .context("Failed to open I2C device")?;
+        ddc.set_vcp_feature(feature_code, value)
+            .context("Failed to set VCP feature")
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -54,10 +79,10 @@ enum Commands {
 
 fn parse_feature_code(s: &str) -> Result<u8, String> {
     if let Some(hex) = s.strip_prefix("0x") {
-        u8::from_str_radix(hex, 16).map_err(|e| format!("Invalid hex feature code: {}", e))
+        u8::from_str_radix(hex, 16).map_err(|e| format!("Invalid hex feature code: {e}"))
     } else {
         s.parse::<u8>()
-            .map_err(|e| format!("Invalid feature code: {}", e))
+            .map_err(|e| format!("Invalid feature code: {e}"))
     }
 }
 
@@ -75,7 +100,7 @@ fn parse_value_input(s: &str) -> Result<ValueInput, String> {
         let is_increase = s.ends_with("%+");
         let percentage = s.trim_end_matches("%+").trim_end_matches("%-");
         let value = percentage.parse::<f32>()
-            .map_err(|e| format!("Invalid percentage value: {}", e))?;
+            .map_err(|e| format!("Invalid percentage value: {e}"))?;
         
         if value < 0.0 {
             return Err("Percentage value cannot be negative".to_string());
@@ -88,11 +113,11 @@ fn parse_value_input(s: &str) -> Result<ValueInput, String> {
     if let Some(hex) = s.strip_prefix("0x") {
         u16::from_str_radix(hex, 16)
             .map(ValueInput::Absolute)
-            .map_err(|e| format!("Invalid hex value: {}", e))
+            .map_err(|e| format!("Invalid hex value: {e}"))
     } else {
         s.parse::<u16>()
             .map(ValueInput::Absolute)
-            .map_err(|e| format!("Invalid value: {}", e))
+            .map_err(|e| format!("Invalid value: {e}"))
     }
 }
 
@@ -125,21 +150,17 @@ fn find_output_dir(output: &str) -> Result<PathBuf> {
     {
         let path = entry.context("Failed to read directory entry")?.path();
         
-        // Get file name as string
-        let file_name = path.file_name();
-        let name = match file_name.and_then(|n| n.to_str()) {
-            Some(name) => name,
-            None => continue,
-        };
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow!("Invalid file name in /sys/class/drm"))?;
         
         // Check if name matches format (card*-output_name)
-        if !name.starts_with("card") || !name.ends_with(output) {
-            continue;
-        }
-        
-        let before_name = name.len() - output.len() - 1;
-        if before_name < name.len() && &name[before_name..before_name+1] == "-" {
-            return Ok(path);
+        if name.starts_with("card") && name.ends_with(output) {
+            let expected_separator_pos = name.len() - output.len() - 1;
+            if expected_separator_pos < name.len() && 
+               name.chars().nth(expected_separator_pos) == Some('-') {
+                return Ok(path);
+            }
         }
     }
     
@@ -163,14 +184,14 @@ fn find_i2c_device_in_dir(dir: &Path, output: &str) -> Result<String> {
 
         // Match i2c device directly (higher priority)
         if name.starts_with("i2c-") {
-            i2c_device = Some(format!("/dev/{}", name));
+            i2c_device = Some(format!("/dev/{name}"));
         } 
         // Handle ddc symlink (lower priority)
         else if name == "ddc" {
             if let Ok(link) = entry.path().read_link() {
                 if let Some(filename) = link.file_name() {
                     let dev_name = filename.to_string_lossy();
-                    ddc_device = Some(format!("/dev/{}", dev_name));
+                    ddc_device = Some(format!("/dev/{dev_name}"));
                 }
             }
         }
@@ -197,8 +218,7 @@ fn get_cache_path(device: &str, feature_code: u8) -> String {
     };
     
     format!(
-        "{}/{}_{:#04x}",
-        DEFAULT_CACHE_DIR, device_name, feature_code
+        "{DEFAULT_CACHE_DIR}/{device_name}_{feature_code:#04x}"
     )
 }
 
@@ -220,27 +240,15 @@ fn read_value_from_cache(device: &str, feature_code: u8) -> Result<u16> {
 }
 
 fn get_feature_value(device_input: &str, feature_code: u8) -> Result<u16> {
-    let device = get_i2c_dev(device_input)?;
-    
-    let mut ddc = ddc_i2c::from_i2c_device(&device).context("Failed to open I2C device")?;
-
-    let vcp = ddc
-        .get_vcp_feature(feature_code)
-        .context("Failed to get VCP feature")?;
-
+    let device = DdcDevice::new(device_input)?;
+    let vcp = device.get_vcp_feature(feature_code)?;
     Ok(vcp.value())
 }
 
 /// Get the maximum value for a feature
 fn get_feature_max_value(device_input: &str, feature_code: u8) -> Result<u16> {
-    let device = get_i2c_dev(device_input)?;
-    
-    let mut ddc = ddc_i2c::from_i2c_device(&device).context("Failed to open I2C device")?;
-
-    let vcp = ddc
-        .get_vcp_feature(feature_code)
-        .context("Failed to get VCP feature")?;
-
+    let device = DdcDevice::new(device_input)?;
+    let vcp = device.get_vcp_feature(feature_code)?;
     Ok(vcp.maximum())
 }
 
@@ -269,8 +277,7 @@ fn calculate_relative_value(
 
 /// Set display feature value, supporting absolute values and relative percentages
 fn set_feature_value_with_input(device_input: &str, feature_code: u8, value_input: ValueInput) -> Result<u16> {
-    // Get device path and max value
-    let device = get_i2c_dev(device_input)?;
+    let device = DdcDevice::new(device_input)?;
     let max_value = get_feature_max_value(device_input, feature_code)?;
     
     // Calculate final value and determine if warning is needed
@@ -278,13 +285,11 @@ fn set_feature_value_with_input(device_input: &str, feature_code: u8, value_inpu
     
     // Show warning if needed
     if let Some(msg) = warning_msg {
-        eprintln!("Warning: {}", msg);
+        eprintln!("Warning: {msg}");
     }
     
     // Set the new value
-    let mut ddc = ddc_i2c::from_i2c_device(&device).context("Failed to set VCP feature")?;
-    ddc.set_vcp_feature(feature_code, final_value)
-        .context("Failed to set VCP feature")?;
+    device.set_vcp_feature(feature_code, final_value)?;
 
     // Save to cache
     save_value_to_cache(device_input, feature_code, final_value)?;
@@ -298,7 +303,7 @@ fn compute_final_value(device_input: &str, feature_code: u8, value_input: ValueI
         ValueInput::Absolute(value) => {
             // Apply range limits to absolute value
             if value > max_value {
-                Ok((max_value, Some(format!("Value exceeds maximum {}", max_value))))
+                Ok((max_value, Some(format!("Value exceeds maximum {max_value}"))))
             } else {
                 Ok((value, None))
             }
@@ -314,89 +319,75 @@ fn compute_final_value(device_input: &str, feature_code: u8, value_input: ValueI
 }
 
 fn listen_feature(device_input: String, feature_code: u8) -> Result<()> {
-    // Validate device path
-    get_i2c_dev(&device_input)?;
+    // Validate device path early
+    DdcDevice::new(&device_input)?;
     
-    // Try to read initial value and print
-    let initial_value = match get_feature_value(&device_input, feature_code) {
-        Ok(value) => {
-            save_value_to_cache(&device_input, feature_code, value)?;
-            value
-        },
-        Err(e) => {
-            // Try to read from cache, return original error if fails
-            read_value_from_cache(&device_input, feature_code).map_err(|_| e)?
-        }
-    };
+    // Get or cache initial value
+    let initial_value = get_feature_value(&device_input, feature_code)
+        .or_else(|e| {
+            // Try cache if device read fails
+            read_value_from_cache(&device_input, feature_code)
+                .map_err(|_| e) // Return original error if cache also fails
+        })?;
     
-    // Print initial value
-    println!("{}", initial_value);
+    // Save to cache and print initial value
+    save_value_to_cache(&device_input, feature_code, initial_value)?;
+    println!("{initial_value}");
     
-    // Track last printed value for deduplication
+    // Setup file monitoring
+    let cache_file = PathBuf::from(get_cache_path(&device_input, feature_code));
     let mut last_value = initial_value;
     
-    // Prepare file monitoring
-    let cache_path = get_cache_path(&device_input, feature_code);
-    let cache_file = PathBuf::from(&cache_path);
-    
-    // Create filesystem watcher
     let (tx, rx) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
+        if tx.send(res).is_err() {
+            // Receiver dropped, watcher should stop
+        }
     })?;
     
-    // Start watching for file changes
     watcher.watch(Path::new(DEFAULT_CACHE_DIR), RecursiveMode::NonRecursive)?;
     
-    // Main loop: listen for file change events
-    while let Ok(event) = rx.recv() {
-        let event = match event {
+    // Main event loop
+    for event_result in rx {
+        let event = match event_result {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("Watch error: {:?}", e);
+                eprintln!("Watch error: {e:?}");
                 continue;
             }
         };
         
-        // Skip events not related to our file
         if !should_handle_event(&event, &cache_file) {
             continue;
         }
         
-        // Read and print new value, try to get from device if cache fails
-        match read_value_from_cache(&device_input, feature_code) {
-            Ok(new_value) => {
-                // Only print if value has changed
-                if new_value != last_value {
-                    println!("{}", new_value);
-                    last_value = new_value;
-                }
-            },
-            Err(_) => {
-                if let Ok(value) = get_feature_value(&device_input, feature_code) {
-                    save_value_to_cache(&device_input, feature_code, value)?;
-                    // Only print if value has changed
-                    if value != last_value {
-                        println!("{}", value);
-                        last_value = value;
-                    }
-                }
+        // Try to read new value from cache, fallback to device
+        let new_value = read_value_from_cache(&device_input, feature_code)
+            .or_else(|_| {
+                get_feature_value(&device_input, feature_code)
+                    .and_then(|value| {
+                        save_value_to_cache(&device_input, feature_code, value)?;
+                        Ok(value)
+                    })
+            });
+        
+        if let Ok(value) = new_value {
+            if value != last_value {
+                println!("{value}");
+                last_value = value;
             }
         }
     }
     
-    // Will never reach here as rx.recv() will block forever
     Ok(())
 }
 
-// Check if the event should be handled
+/// Check if the event should be handled
 fn should_handle_event(event: &Event, cache_file: &Path) -> bool {
-    match event.kind {
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-            event.paths.iter().any(|path| path == cache_file)
-        },
-        _ => false,
-    }
+    matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) && event.paths.iter().any(|path| path == cache_file)
 }
 
 fn main() -> Result<()> {
@@ -420,7 +411,7 @@ fn main() -> Result<()> {
 /// Handle the Get command
 fn handle_get_command(device: &str, feature_code: u8) -> Result<()> {
     let value = get_feature_value(device, feature_code)?;
-    println!("Feature {:#04x}: {}", feature_code, value);
+    println!("Feature {feature_code:#04x}: {value}");
 
     // Update cache
     save_value_to_cache(device, feature_code, value)?;
@@ -436,6 +427,6 @@ fn handle_set_command(device: &str, feature_code: u8, value_str: &str) -> Result
     // Set value
     let new_value = set_feature_value_with_input(device, feature_code, value_input)?;
     
-    println!("Set feature {:#04x} to {}", feature_code, new_value);
+    println!("Set feature {feature_code:#04x} to {new_value}");
     Ok(())
 }
