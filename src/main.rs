@@ -148,31 +148,43 @@ fn find_output_dir(output: &str) -> Result<PathBuf> {
 
 /// Find I2C device in the display output directory
 fn find_i2c_device_in_dir(dir: &Path, output: &str) -> Result<String> {
+    let mut ddc_device: Option<String> = None;
+    let mut i2c_device: Option<String> = None;
+
     for entry in read_dir(dir).context("Failed to read output directory")? {
         let entry = entry.context("Failed to read directory entry")?;
-        
+
         // Get file name as string
         let file_name = entry.file_name();
         let name = match file_name.to_str() {
             Some(name) => name,
             None => continue,
         };
-        
-        // Match i2c device directly
+
+        // Match i2c device directly (higher priority)
         if name.starts_with("i2c-") {
-            return Ok(format!("/dev/{}", name));
+            i2c_device = Some(format!("/dev/{}", name));
         } 
-        // Handle ddc symlink
+        // Handle ddc symlink (lower priority)
         else if name == "ddc" {
             if let Ok(link) = entry.path().read_link() {
                 if let Some(filename) = link.file_name() {
                     let dev_name = filename.to_string_lossy();
-                    return Ok(format!("/dev/{}", dev_name));
+                    ddc_device = Some(format!("/dev/{}", dev_name));
                 }
             }
         }
     }
-    
+
+    // Prefer direct i2c device over ddc symlink
+    if let Some(device) = i2c_device {
+        return Ok(device);
+    }
+
+    if let Some(device) = ddc_device {
+        return Ok(device);
+    }
+
     Err(anyhow!("I2C device for output '{}' not found", output))
 }
 
